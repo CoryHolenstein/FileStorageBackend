@@ -3,44 +3,98 @@ import { S3Client, PutObjectCommand, ListObjectsV2Command, DeleteObjectsCommand 
 const s3Client = new S3Client({ region: process.env.AWS_REGION || "us-east-1" });
 let S3_BASE_ACCOUNTS_ARN = process.env.S3_FREE_ACCOUNTS_ARN;
 
-// Extract bucket name from ARN if needed
-const getBucketName = (arn) => {
-  if (arn.startsWith('arn:aws:s3:::')) {
-    return arn.replace('arn:aws:s3:::', '');
-  }
-  return arn; // Assume it's already a bucket name
-};
 
-
-const getItemCount = async (body) => { 
-  console.log("item count body is: ", body);
+const listFiles = async (body) => {
+  console.log("list files body is: ", body);
   
-  const { userId } = body; // Adjust based on your body structure
+  const { userId } = body;
   
   if (!userId) {
     throw new Error("userId is required");
   }
   
-  // Construct the S3 prefix for the user's files
-  const prefix = `${userId}/`; // Adjust this based on your S3 structure
+  const prefix = `${userId}/`;
   
-  let itemCount = 0;
+  let files = [];
   let continuationToken = undefined;
   
-  // Paginate through all objects under the user's prefix
   do {
     const command = new ListObjectsV2Command({
-      Bucket: getBucketName(S3_BASE_ACCOUNTS_ARN), // Note: This should be bucket NAME, not ARN
+      Bucket: getBucketName(S3_BASE_ACCOUNTS_ARN),
       Prefix: prefix,
       ContinuationToken: continuationToken
     });
     
     const response = await s3Client.send(command);
     
-    // Add the count of objects in this page
-    itemCount += response.KeyCount || 0;
+    if (response.Contents) {
+      for (const obj of response.Contents) {
+        // Skip the folder itself (if it exists as an object)
+        if (obj.Key === prefix) continue;
+        
+        files.push({
+          id: obj.ETag?.replace(/"/g, '') || obj.Key,
+          name: obj.Key.replace(prefix, ''),
+          size: formatBytes(obj.Size || 0),
+          sizeBytes: obj.Size || 0,
+          uploadedDate: obj.LastModified?.toISOString().split('T')[0] || '',
+          key: obj.Key
+        });
+      }
+    }
     
-    // Get the continuation token for the next page
+    continuationToken = response.NextContinuationToken;
+    
+  } while (continuationToken);
+  
+  return {
+    userId,
+    files,
+    count: files.length
+  };
+};
+
+// Helper function for formatting
+const formatBytes = (bytes) => {
+  if (bytes === 0) return '0 Bytes';
+  const k = 1024;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+};
+
+
+// Extract bucket name from ARN if needed
+const getBucketName = (arn) => {
+  if (arn.startsWith('arn:aws:s3:::')) {
+    return arn.replace('arn:aws:s3:::', '');
+  }
+  return arn;
+};
+
+const getItemCount = async (body) => { 
+  console.log("item count body is: ", body);
+  
+  const { userId } = body;
+  
+  if (!userId) {
+    throw new Error("userId is required");
+  }
+  
+  const prefix = `${userId}/`;
+  
+  let itemCount = 0;
+  let continuationToken = undefined;
+  
+  do {
+    const command = new ListObjectsV2Command({
+      Bucket: getBucketName(S3_BASE_ACCOUNTS_ARN),
+      Prefix: prefix,
+      ContinuationToken: continuationToken
+    });
+    
+    const response = await s3Client.send(command);
+    itemCount += response.KeyCount || 0;
     continuationToken = response.NextContinuationToken;
     
   } while (continuationToken);
@@ -52,8 +106,6 @@ const getItemCount = async (body) => {
   };
 };
 
-
-
 const getFolderSize = async (body) => { 
   console.log("folder size body is: ", body);
   
@@ -63,14 +115,12 @@ const getFolderSize = async (body) => {
     throw new Error("userId is required");
   }
   
-  // Construct the S3 prefix for the user's files
   const prefix = `${userId}/`;
   
   let totalSize = 0;
   let itemCount = 0;
   let continuationToken = undefined;
   
-  // Paginate through all objects under the user's prefix
   do {
     const command = new ListObjectsV2Command({
       Bucket: getBucketName(S3_BASE_ACCOUNTS_ARN),
@@ -80,7 +130,6 @@ const getFolderSize = async (body) => {
     
     const response = await s3Client.send(command);
     
-    // Sum up the sizes of all objects in this page
     if (response.Contents) {
       for (const obj of response.Contents) {
         totalSize += obj.Size || 0;
@@ -88,7 +137,6 @@ const getFolderSize = async (body) => {
       }
     }
     
-    // Get the continuation token for the next page
     continuationToken = response.NextContinuationToken;
     
   } while (continuationToken);
@@ -101,7 +149,46 @@ const getFolderSize = async (body) => {
     itemCount,
     prefix
   };
-}
+};
+
+const addFile = async (body) => {
+  console.log("add file body is: ", body);
+  
+  const { userId, fileName, fileContent, contentType } = body;
+  
+  if (!userId) {
+    throw new Error("userId is required");
+  }
+  if (!fileName) {
+    throw new Error("fileName is required");
+  }
+  if (!fileContent) {
+    throw new Error("fileContent is required");
+  }
+  
+  // Construct the S3 key for the file
+  const key = `${userId}/${fileName}`;
+  
+  // Decode base64 content
+  const buffer = Buffer.from(fileContent, 'base64');
+  
+  const command = new PutObjectCommand({
+    Bucket: getBucketName(S3_BASE_ACCOUNTS_ARN),
+    Key: key,
+    Body: buffer,
+    ContentType: contentType || 'application/octet-stream'
+  });
+  
+  await s3Client.send(command);
+  
+  return {
+    userId,
+    fileName,
+    key,
+    size: buffer.length,
+    message: "File uploaded successfully"
+  };
+};
 
 export const handler = async (event) => {
   console.log("EVENT:", event);
@@ -115,8 +202,12 @@ export const handler = async (event) => {
 
     if (path.endsWith("/files/get-item-count")) {
       result = await getItemCount(body);
-    }else if (path.endsWith("/files/get-folder-size")) {
+    } else if (path.endsWith("/files/get-folder-size")) {
       result = await getFolderSize(body);
+    } else if (path.endsWith("/files/add-file")) {
+      result = await addFile(body);
+    } else if (path.endsWith("/files/list-files")) {
+      result = await listFiles(body);
     } else {
       return { statusCode: 400, body: "Unknown route" };
     }
