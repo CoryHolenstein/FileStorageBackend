@@ -1,12 +1,12 @@
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } from "@aws-sdk/client-s3";
 
 const s3Client = new S3Client({ region: process.env.AWS_REGION || "us-east-1" });
 let S3_BASE_ACCOUNTS_ARN = process.env.S3_FREE_ACCOUNTS_ARN;
 
 // Extract bucket name from ARN if needed
 const getBucketName = (arn) => {
-  if (arn.startsWith('arn:aws:s3::: ')) {
-    return arn.replace('arn:aws:s3:: :', '');
+  if (arn.startsWith('arn:aws:s3:::')) {
+    return arn.replace('arn:aws:s3:::', '');
   }
   return arn; // Assume it's already a bucket name
 };
@@ -20,7 +20,7 @@ let createInitialFolder = async (body) => {
   }
 
   const bucketName = getBucketName(S3_BASE_ACCOUNTS_ARN);
-  const identifier = userId || accountId || email. replace('@', '_at_');
+  const identifier = userId || accountId || email.replace('@', '_at_');
   
   // Create initial folder structure
   // S3 doesn't have real folders, but we create them by adding objects with trailing slashes
@@ -75,7 +75,7 @@ let createFolder = async (body) => {
   const identifier = userId || accountId;
   
   // Construct the full folder path
-  const basePath = folderPath ?  `${identifier}/${folderPath}` : identifier;
+  const basePath = folderPath ? `${identifier}/${folderPath}` : identifier;
   const fullFolderKey = `${basePath}/${folderName}/`;
 
   try {
@@ -89,7 +89,7 @@ let createFolder = async (body) => {
     await s3Client.send(command);
 
     return {
-      success:  true,
+      success: true,
       message: 'Folder created successfully',
       folderPath: fullFolderKey,
       bucketName: bucketName,
@@ -100,11 +100,99 @@ let createFolder = async (body) => {
   }
 };
 
+let deleteFolder = async (body) => {
+  const { userId, accountId, folderPath } = body;
+
+  // Validate required fields
+  if (!userId && !accountId) {
+    throw new Error('userId or accountId is required');
+  }
+  
+  if (!folderPath) {
+    throw new Error('folderPath is required');
+  }
+
+  const bucketName = getBucketName(S3_BASE_ACCOUNTS_ARN);
+  const identifier = userId || accountId;
+  
+  // Construct the full folder path - ensure it ends with /
+  const fullFolderKey = folderPath.endsWith('/') 
+    ? `${identifier}/${folderPath}` 
+    : `${identifier}/${folderPath}/`;
+
+  try {
+    // List all objects in the folder (including subfolders)
+    let allObjects = [];
+    let continuationToken = null;
+
+    do {
+      const listCommand = new ListObjectsV2Command({
+        Bucket: bucketName,
+        Prefix: fullFolderKey,
+        ContinuationToken: continuationToken,
+      });
+
+      const listResponse = await s3Client.send(listCommand);
+      
+      if (listResponse.Contents && listResponse.Contents.length > 0) {
+        allObjects.push(...listResponse.Contents);
+      }
+
+      continuationToken = listResponse.IsTruncated ? listResponse.NextContinuationToken : null;
+    } while (continuationToken);
+
+    // If no objects found, folder doesn't exist or is already empty
+    if (allObjects.length === 0) {
+      return {
+        success: true,
+        message: 'Folder not found or already empty',
+        folderPath: fullFolderKey,
+        deletedCount: 0,
+      };
+    }
+
+    // Delete objects in batches of 1000 (S3 limit)
+    const batchSize = 1000;
+    let totalDeleted = 0;
+
+    for (let i = 0; i < allObjects.length; i += batchSize) {
+      const batch = allObjects.slice(i, i + batchSize);
+      
+      const deleteCommand = new DeleteObjectsCommand({
+        Bucket: bucketName,
+        Delete: {
+          Objects: batch.map(obj => ({ Key: obj.Key })),
+          Quiet: true, // Don't return info about each deleted object
+        },
+      });
+
+      const deleteResponse = await s3Client.send(deleteCommand);
+      totalDeleted += batch.length;
+
+      // Check for errors
+      if (deleteResponse.Errors && deleteResponse.Errors.length > 0) {
+        console.error('Some objects failed to delete:', deleteResponse.Errors);
+      }
+    }
+
+    return {
+      success: true,
+      message: 'Folder and all contents deleted successfully',
+      folderPath: fullFolderKey,
+      deletedCount: totalDeleted,
+      bucketName: bucketName,
+    };
+  } catch (error) {
+    console.error('Error deleting folder:', error);
+    throw new Error(`Failed to delete folder: ${error.message}`);
+  }
+};
+
 export const handler = async (event) => {
   console.log("EVENT:", event);
 
-  const route = event. routeKey; 
-  const body = JSON.parse(event. body || "{}");
+  const route = event.routeKey; 
+  const body = JSON.parse(event.body || "{}");
 
   try {
     let result;
@@ -114,10 +202,8 @@ export const handler = async (event) => {
       result = await createInitialFolder(body);
     } else if (path.endsWith("/folders/create-folder")) {
       result = await createFolder(body);
-    } else if (path.endsWith("/folders/get-all-tasks")) {
-     // result = await getAllTasks(body);
-    } else if (path.endsWith("/folders/delete-task")) {
-     // result = await deleteTask(body);
+    } else if (path.endsWith("/folders/delete-folder")) {
+      result = await deleteFolder(body);
     } else {
       return { statusCode: 400, body: "Unknown route" };
     }

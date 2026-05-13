@@ -1,4 +1,4 @@
-import { S3Client, PutObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, ListObjectsV2Command, DeleteObjectsCommand, CopyObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 
 const s3Client = new S3Client({ region: process.env.AWS_REGION || "us-east-1" });
 let S3_BASE_ACCOUNTS_ARN = process.env.S3_FREE_ACCOUNTS_ARN;
@@ -151,11 +151,10 @@ const getFolderSize = async (body) => {
   };
 };
 
+
 const addFile = async (body) => {
   console.log("add file body is: ", body);
-  
   const { userId, fileName, fileContent, contentType } = body;
-  
   if (!userId) {
     throw new Error("userId is required");
   }
@@ -165,22 +164,15 @@ const addFile = async (body) => {
   if (!fileContent) {
     throw new Error("fileContent is required");
   }
-  
-  // Construct the S3 key for the file
   const key = `${userId}/${fileName}`;
-  
-  // Decode base64 content
   const buffer = Buffer.from(fileContent, 'base64');
-  
   const command = new PutObjectCommand({
     Bucket: getBucketName(S3_BASE_ACCOUNTS_ARN),
     Key: key,
     Body: buffer,
     ContentType: contentType || 'application/octet-stream'
   });
-  
   await s3Client.send(command);
-  
   return {
     userId,
     fileName,
@@ -190,33 +182,225 @@ const addFile = async (body) => {
   };
 };
 
+const deleteFile = async (body) => {
+  console.log("delete file body is: ", body);
+  const { userId, fileName } = body;
+  if (!userId) {
+    throw new Error("userId is required");
+  }
+  if (!fileName) {
+    throw new Error("fileName is required");
+  }
+  const key = `${userId}/${fileName}`;
+  const command = new DeleteObjectsCommand({
+    Bucket: getBucketName(S3_BASE_ACCOUNTS_ARN),
+    Delete: {
+      Objects: [ { Key: key } ],
+      Quiet: false
+    }
+  });
+  const response = await s3Client.send(command);
+  const deleted = response.Deleted && response.Deleted.find(obj => obj.Key === key);
+  if (!deleted) {
+    throw new Error("File not found or could not be deleted");
+  }
+  return {
+    userId,
+    fileName,
+    key,
+    message: "File deleted successfully"
+  };
+};
+
+const moveFile = async (body) => {
+  console.log("move file body is: ", body);
+  const { userId, sourceFileName, destinationFolderPath = "" } = body;
+
+  if (!userId) {
+    throw new Error("userId is required");
+  }
+  if (!sourceFileName) {
+    throw new Error("sourceFileName is required");
+  }
+
+  const bucketName = getBucketName(S3_BASE_ACCOUNTS_ARN);
+  const normalizedSource = `${sourceFileName}`.replace(/^\/+|\/+$/g, "");
+  const normalizedDestination = `${destinationFolderPath}`.replace(/^\/+|\/+$/g, "");
+  const fileBaseName = normalizedSource.split("/").pop();
+
+  if (!fileBaseName) {
+    throw new Error("sourceFileName is invalid");
+  }
+
+  const sourceKey = `${userId}/${normalizedSource}`;
+  const destinationKey = normalizedDestination
+    ? `${userId}/${normalizedDestination}/${fileBaseName}`
+    : `${userId}/${fileBaseName}`;
+
+  if (sourceKey === destinationKey) {
+    return {
+      success: true,
+      message: "File already in destination folder",
+      sourceKey,
+      destinationKey
+    };
+  }
+
+  const encodedCopySource = encodeURIComponent(`${bucketName}/${sourceKey}`);
+
+  await s3Client.send(
+    new CopyObjectCommand({
+      Bucket: bucketName,
+      CopySource: encodedCopySource,
+      Key: destinationKey
+    })
+  );
+
+  await s3Client.send(
+    new DeleteObjectCommand({
+      Bucket: bucketName,
+      Key: sourceKey
+    })
+  );
+
+  return {
+    success: true,
+    message: "File moved successfully",
+    sourceKey,
+    destinationKey,
+    bucketName
+  };
+};
+
+const createFolder = async (body) => {
+  console.log("create folder body is: ", body);
+  const { userId, accountId, folderPath, folderName } = body;
+  if (!userId && !accountId) {
+    throw new Error("userId or accountId is required");
+  }
+  if (!folderName) {
+    throw new Error("folderName is required");
+  }
+  const identifier = userId || accountId;
+  const normalizedFolderPath = folderPath
+    ? `${folderPath}`.replace(/^\/+|\/+$/g, "")
+    : "";
+  const basePath = normalizedFolderPath
+    ? `${identifier}/${normalizedFolderPath}`
+    : `${identifier}`;
+  const fullFolderKey = `${basePath}/${folderName}/`;
+  const command = new PutObjectCommand({
+    Bucket: getBucketName(S3_BASE_ACCOUNTS_ARN),
+    Key: fullFolderKey,
+    Body: "",
+    ContentType: "application/x-directory"
+  });
+  await s3Client.send(command);
+  return {
+    success: true,
+    message: "Folder created successfully",
+    folderPath: fullFolderKey,
+    bucketName: getBucketName(S3_BASE_ACCOUNTS_ARN)
+  };
+};
+
+const deleteFolder = async (body) => {
+  console.log("delete folder body is: ", body);
+  const { userId, accountId, folderPath } = body;
+  if (!userId && !accountId) {
+    throw new Error("userId or accountId is required");
+  }
+  if (!folderPath) {
+    throw new Error("folderPath is required");
+  }
+  const identifier = userId || accountId;
+  const normalizedFolderPath = `${folderPath}`.replace(/^\/+|\/+$/g, "");
+  const fullFolderKey = `${identifier}/${normalizedFolderPath}/`;
+  const bucketName = getBucketName(S3_BASE_ACCOUNTS_ARN);
+
+  let continuationToken = undefined;
+  const allKeys = [];
+  do {
+    const listCommand = new ListObjectsV2Command({
+      Bucket: bucketName,
+      Prefix: fullFolderKey,
+      ContinuationToken: continuationToken
+    });
+    const listResponse = await s3Client.send(listCommand);
+    if (listResponse.Contents) {
+      for (const obj of listResponse.Contents) {
+        if (obj.Key) {
+          allKeys.push({ Key: obj.Key });
+        }
+      }
+    }
+    continuationToken = listResponse.NextContinuationToken;
+  } while (continuationToken);
+
+  if (allKeys.length === 0) {
+    return {
+      success: true,
+      message: "Folder not found or already empty",
+      folderPath: fullFolderKey,
+      deletedCount: 0,
+      bucketName
+    };
+  }
+
+  const batchSize = 1000;
+  let totalDeleted = 0;
+  for (let i = 0; i < allKeys.length; i += batchSize) {
+    const batch = allKeys.slice(i, i + batchSize);
+    const deleteCommand = new DeleteObjectsCommand({
+      Bucket: bucketName,
+      Delete: {
+        Objects: batch,
+        Quiet: true
+      }
+    });
+    await s3Client.send(deleteCommand);
+    totalDeleted += batch.length;
+  }
+
+  return {
+    success: true,
+    message: "Folder and all contents deleted successfully",
+    folderPath: fullFolderKey,
+    deletedCount: totalDeleted,
+    bucketName
+  };
+};
+
 export const handler = async (event) => {
   console.log("EVENT:", event);
-
   const route = event.routeKey; 
   const body = JSON.parse(event.body || "{}");
-
   try {
     let result;
     const path = event.rawPath;
-
     if (path.endsWith("/files/get-item-count")) {
       result = await getItemCount(body);
     } else if (path.endsWith("/files/get-folder-size")) {
       result = await getFolderSize(body);
     } else if (path.endsWith("/files/add-file")) {
       result = await addFile(body);
+    } else if (path.endsWith("/files/delete-file")) {
+      result = await deleteFile(body);
+    } else if (path.endsWith("/files/move-file")) {
+      result = await moveFile(body);
     } else if (path.endsWith("/files/list-files")) {
       result = await listFiles(body);
+    } else if (path.endsWith("/folders/create-folder")) {
+      result = await createFolder(body);
+    } else if (path.endsWith("/folders/delete-folder")) {
+      result = await deleteFolder(body);
     } else {
       return { statusCode: 400, body: "Unknown route" };
     }
-    
     return {
       statusCode: 200,
       body: JSON.stringify(result)
     };
-
   } catch (err) {
     console.error("Error:", err);
     return {
