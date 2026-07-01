@@ -3,6 +3,22 @@ import { S3Client, PutObjectCommand, ListObjectsV2Command, DeleteObjectsCommand 
 const s3Client = new S3Client({ region: process.env.AWS_REGION || "us-east-1" });
 let S3_BASE_ACCOUNTS_ARN = process.env.S3_FREE_ACCOUNTS_ARN;
 
+const safeLogBody = (body = {}) => {
+  if (!body || typeof body !== "object") {
+    return body;
+  }
+
+  const { fileContent, ...rest } = body;
+  if (!fileContent) {
+    return rest;
+  }
+
+  return {
+    ...rest,
+    fileContentLength: fileContent.length
+  };
+};
+
 // Extract bucket name from ARN if needed
 const getBucketName = (arn) => {
   if (arn.startsWith('arn:aws:s3:::')) {
@@ -189,10 +205,20 @@ let deleteFolder = async (body) => {
 };
 
 export const handler = async (event) => {
-  console.log("EVENT:", event);
+  console.log("EVENT:", {
+    routeKey: event?.routeKey,
+    rawPath: event?.rawPath,
+    requestId: event?.requestContext?.requestId
+  });
 
   const route = event.routeKey; 
   const body = JSON.parse(event.body || "{}");
+  console.log("REQUEST BODY:", safeLogBody(body));
+
+  const jwtSub = event?.requestContext?.authorizer?.jwt?.claims?.sub;
+  if (jwtSub) {
+    body.userId = jwtSub;
+  }
 
   try {
     let result;

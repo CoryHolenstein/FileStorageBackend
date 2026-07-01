@@ -2,10 +2,42 @@ import { S3Client, PutObjectCommand, ListObjectsV2Command, DeleteObjectsCommand,
 
 const s3Client = new S3Client({ region: process.env.AWS_REGION || "us-east-1" });
 let S3_BASE_ACCOUNTS_ARN = process.env.S3_FREE_ACCOUNTS_ARN;
+const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 7 * 1024 * 1024);
+
+const safeLogBody = (body = {}) => {
+  if (!body || typeof body !== "object") {
+    return body;
+  }
+
+  const { fileContent, ...rest } = body;
+  if (!fileContent) {
+    return rest;
+  }
+
+  return {
+    ...rest,
+    fileContentLength: fileContent.length
+  };
+};
+
+const enforceSafeFileName = (fileName) => {
+  if (typeof fileName !== "string" || !fileName.trim()) {
+    throw new Error("fileName is required");
+  }
+
+  const normalized = fileName.trim();
+  const hasUnsafePath = normalized.startsWith("/") || normalized.includes("\\") || normalized.includes("..") || normalized.includes("\u0000");
+
+  if (hasUnsafePath) {
+    throw new Error("fileName contains unsafe path characters");
+  }
+
+  return normalized;
+};
 
 
 const listFiles = async (body) => {
-  console.log("list files body is: ", body);
+  console.log("list files body is: ", safeLogBody(body));
   
   const { userId } = body;
   
@@ -73,7 +105,7 @@ const getBucketName = (arn) => {
 };
 
 const getItemCount = async (body) => { 
-  console.log("item count body is: ", body);
+  console.log("item count body is: ", safeLogBody(body));
   
   const { userId } = body;
   
@@ -107,7 +139,7 @@ const getItemCount = async (body) => {
 };
 
 const getFolderSize = async (body) => { 
-  console.log("folder size body is: ", body);
+  console.log("folder size body is: ", safeLogBody(body));
   
   const { userId } = body;
   
@@ -153,19 +185,28 @@ const getFolderSize = async (body) => {
 
 
 const addFile = async (body) => {
-  console.log("add file body is: ", body);
+  console.log("add file body is: ", safeLogBody(body));
   const { userId, fileName, fileContent, contentType } = body;
   if (!userId) {
     throw new Error("userId is required");
   }
-  if (!fileName) {
-    throw new Error("fileName is required");
-  }
+  const safeFileName = enforceSafeFileName(fileName);
   if (!fileContent) {
     throw new Error("fileContent is required");
   }
-  const key = `${userId}/${fileName}`;
+
+  const estimatedBytes = Math.floor((fileContent.length * 3) / 4);
+  if (estimatedBytes > MAX_UPLOAD_BYTES) {
+    throw new Error(`File exceeds upload limit of ${MAX_UPLOAD_BYTES} bytes for this API route`);
+  }
+
+  const key = `${userId}/${safeFileName}`;
   const buffer = Buffer.from(fileContent, 'base64');
+
+  if (buffer.length > MAX_UPLOAD_BYTES) {
+    throw new Error(`File exceeds upload limit of ${MAX_UPLOAD_BYTES} bytes for this API route`);
+  }
+
   const command = new PutObjectCommand({
     Bucket: getBucketName(S3_BASE_ACCOUNTS_ARN),
     Key: key,
@@ -175,7 +216,7 @@ const addFile = async (body) => {
   await s3Client.send(command);
   return {
     userId,
-    fileName,
+    fileName: safeFileName,
     key,
     size: buffer.length,
     message: "File uploaded successfully"
@@ -183,15 +224,13 @@ const addFile = async (body) => {
 };
 
 const deleteFile = async (body) => {
-  console.log("delete file body is: ", body);
+  console.log("delete file body is: ", safeLogBody(body));
   const { userId, fileName } = body;
   if (!userId) {
     throw new Error("userId is required");
   }
-  if (!fileName) {
-    throw new Error("fileName is required");
-  }
-  const key = `${userId}/${fileName}`;
+  const safeFileName = enforceSafeFileName(fileName);
+  const key = `${userId}/${safeFileName}`;
   const command = new DeleteObjectsCommand({
     Bucket: getBucketName(S3_BASE_ACCOUNTS_ARN),
     Delete: {
@@ -206,14 +245,14 @@ const deleteFile = async (body) => {
   }
   return {
     userId,
-    fileName,
+    fileName: safeFileName,
     key,
     message: "File deleted successfully"
   };
 };
 
 const moveFile = async (body) => {
-  console.log("move file body is: ", body);
+  console.log("move file body is: ", safeLogBody(body));
   const { userId, sourceFileName, destinationFolderPath = "" } = body;
 
   if (!userId) {
@@ -224,7 +263,7 @@ const moveFile = async (body) => {
   }
 
   const bucketName = getBucketName(S3_BASE_ACCOUNTS_ARN);
-  const normalizedSource = `${sourceFileName}`.replace(/^\/+|\/+$/g, "");
+  const normalizedSource = enforceSafeFileName(`${sourceFileName}`.replace(/^\/+|\/+$/g, ""));
   const normalizedDestination = `${destinationFolderPath}`.replace(/^\/+|\/+$/g, "");
   const fileBaseName = normalizedSource.split("/").pop();
 
@@ -273,7 +312,7 @@ const moveFile = async (body) => {
 };
 
 const createFolder = async (body) => {
-  console.log("create folder body is: ", body);
+  console.log("create folder body is: ", safeLogBody(body));
   const { userId, accountId, folderPath, folderName } = body;
   if (!userId && !accountId) {
     throw new Error("userId or accountId is required");
@@ -305,7 +344,7 @@ const createFolder = async (body) => {
 };
 
 const deleteFolder = async (body) => {
-  console.log("delete folder body is: ", body);
+  console.log("delete folder body is: ", safeLogBody(body));
   const { userId, accountId, folderPath } = body;
   if (!userId && !accountId) {
     throw new Error("userId or accountId is required");
@@ -372,9 +411,19 @@ const deleteFolder = async (body) => {
 };
 
 export const handler = async (event) => {
-  console.log("EVENT:", event);
+  console.log("EVENT:", {
+    routeKey: event?.routeKey,
+    rawPath: event?.rawPath,
+    requestId: event?.requestContext?.requestId
+  });
   const route = event.routeKey; 
   const body = JSON.parse(event.body || "{}");
+
+  const jwtSub = event?.requestContext?.authorizer?.jwt?.claims?.sub;
+  if (jwtSub) {
+    body.userId = jwtSub;
+  }
+
   try {
     let result;
     const path = event.rawPath;
